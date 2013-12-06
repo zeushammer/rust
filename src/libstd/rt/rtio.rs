@@ -9,7 +9,7 @@
 // except according to those terms.
 
 use c_str::CString;
-use comm::{SharedChan, PortOne, Port};
+use comm::{SharedChan, Port};
 use libc::c_int;
 use libc;
 use option::*;
@@ -190,7 +190,7 @@ pub trait RtioUdpSocket : RtioSocket {
 
 pub trait RtioTimer {
     fn sleep(&mut self, msecs: u64);
-    fn oneshot(&mut self, msecs: u64) -> PortOne<()>;
+    fn oneshot(&mut self, msecs: u64) -> Port<()>;
     fn period(&mut self, msecs: u64) -> Port<()>;
 }
 

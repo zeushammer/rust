@@ -17,7 +17,6 @@ use super::stack::{StackPool};
 use super::rtio::EventLoop;
 use super::context::Context;
 use super::task::{Task, AnySched, Sched};
-use super::message_queue::MessageQueue;
 use rt::kill::BlockedTask;
 use rt::deque;
 use rt::local_ptr;
@@ -30,6 +29,7 @@ use iter::range;
 use unstable::mutex::Mutex;
 use vec::{OwnedVector};
 
+use mpsc = super::mpsc_queue;
 
 /// A scheduler is responsible for coordinating the execution of Tasks
 /// on a single thread. The scheduler runs inside a slightly modified
@@ -48,7 +48,9 @@ pub struct Scheduler {
     /// The queue of incoming messages from other schedulers.
     /// These are enqueued by SchedHandles after which a remote callback
     /// is triggered to handle the message.
-    message_queue: MessageQueue<SchedMessage>,
+    message_queue: mpsc::Consumer<SchedMessage, ()>,
+    /// Producer used to clone sched handles from
+    message_producer: mpsc::Producer<SchedMessage, ()>,
     /// A shared list of sleeping schedulers. We'll use this to wake
     /// up schedulers when pushing work onto the work queue.
     sleeper_list: SleeperList,
@@ -105,7 +107,7 @@ enum EffortLevel {
     GiveItYourBest
 }
 
-static MAX_YIELD_CHECKS: uint = 200;
+static MAX_YIELD_CHECKS: uint = 20000;
 
 fn reset_yield_check(rng: &mut XorShiftRng) -> uint {
     let r: uint = Rand::rand(rng);
@@ -136,9 +138,11 @@ impl Scheduler {
                        friend: Option<SchedHandle>)
         -> Scheduler {
 
+        let (consumer, producer) = mpsc::queue(());
         let mut sched = Scheduler {
             sleeper_list: sleeper_list,
-            message_queue: MessageQueue::new(),
+            message_queue: consumer,
+            message_producer: producer,
             sleepy: false,
             no_sleep: false,
             event_loop: event_loop,
@@ -219,7 +223,7 @@ impl Scheduler {
 
         // Should not have any messages
         let message = stask.sched.get_mut_ref().message_queue.pop();
-        rtassert!(message.is_none());
+        rtassert!(match message { mpsc::Empty => true, _ => false });
 
         stask.destroyed = true;
     }
@@ -316,10 +320,27 @@ impl Scheduler {
     fn interpret_message_queue(mut ~self, effort: EffortLevel) -> Option<~Scheduler> {
 
         let msg = if effort == DontTryTooHard {
-            // Do a cheap check that may miss messages
             self.message_queue.casual_pop()
         } else {
-            self.message_queue.pop()
+            // When popping our message queue, we could see an "inconsistent"
+            // state which means that we *should* be able to pop data, but we
+            // are unable to at this time. Our options are:
+            //
+            //  1. Spin waiting for data
+            //  2. Ignore this and pretend we didn't find a message
+            //
+            // If we choose route 1, then if the pusher in question is currently
+            // pre-empted, we're going to take up our entire time slice just
+            // spinning on this queue. If we choose route 2, then the pusher in
+            // question is still guaranteed to make a send() on its async
+            // handle, so we will guaranteed wake up and see its message at some
+            // point.
+            //
+            // I have chosen to take route #2.
+            match self.message_queue.pop() {
+                mpsc::Data(t) => Some(t),
+                mpsc::Empty | mpsc::Inconsistent => None
+            }
         };
 
         match msg {
@@ -796,7 +817,7 @@ impl Scheduler {
 
         return SchedHandle {
             remote: remote,
-            queue: self.message_queue.clone(),
+            queue: self.message_producer.clone(),
             sched_id: self.sched_id()
         };
     }
@@ -816,7 +837,7 @@ pub enum SchedMessage {
 
 pub struct SchedHandle {
     priv remote: ~RemoteCallback,
-    priv queue: MessageQueue<SchedMessage>,
+    priv queue: mpsc::Producer<SchedMessage, ()>,
     sched_id: uint
 }
 
@@ -920,18 +941,18 @@ mod test {
     extern mod extra;
 
     use prelude::*;
-    use rt::test::*;
-    use unstable::run_in_bare_thread;
+
     use borrow::to_uint;
-    use rt::sched::{Scheduler};
     use cell::Cell;
     use rt::deque::BufferPool;
-    use rt::thread::Thread;
-    use rt::task::{Task, Sched};
     use rt::basic;
+    use rt::sched::{Scheduler};
+    use rt::task::{Task, Sched};
+    use rt::test::*;
+    use rt::thread::Thread;
     use rt::util;
-    use option::{Some};
-    use rt::task::UnwindResult;
+    use task::TaskResult;
+    use unstable::run_in_bare_thread;
 
     #[test]
     fn trivial_run_in_newsched_task_test() {
@@ -1016,8 +1037,8 @@ mod test {
                 assert!(Task::on_appropriate_sched());
             };
 
-            let on_exit: proc(UnwindResult) = proc(exit_status) {
-                rtassert!(exit_status.is_success())
+            let on_exit: proc(TaskResult) = proc(exit_status) {
+                rtassert!(exit_status.is_ok())
             };
             task.death.on_exit = Some(on_exit);
 
@@ -1033,7 +1054,6 @@ mod test {
         use rt::sleeper_list::SleeperList;
         use rt::sched::Shutdown;
         use borrow;
-        use rt::comm::*;
 
         do run_in_bare_thread {
 
@@ -1094,23 +1114,16 @@ mod test {
             };
             rtdebug!("task4 id: **{}**", borrow::to_uint(task4));
 
-            let task1 = Cell::new(task1);
-            let task2 = Cell::new(task2);
-            let task3 = Cell::new(task3);
-            let task4 = Cell::new(task4);
-
             // Signal from the special task that we are done.
-            let (port, chan) = oneshot::<()>();
-            let port = Cell::new(port);
-            let chan = Cell::new(chan);
+            let (port, chan) = Chan::<()>::new();
 
             let normal_task = ~do Task::new_root(&mut normal_sched.stack_pool, None) {
                 rtdebug!("*about to submit task2*");
-                Scheduler::run_task(task2.take());
+                Scheduler::run_task(task2);
                 rtdebug!("*about to submit task4*");
-                Scheduler::run_task(task4.take());
+                Scheduler::run_task(task4);
                 rtdebug!("*normal_task done*");
-                port.take().recv();
+                port.recv();
                 let mut nh = normal_handle.take();
                 nh.send(Shutdown);
                 let mut sh = special_handle.take();
@@ -1121,11 +1134,11 @@ mod test {
 
             let special_task = ~do Task::new_root(&mut special_sched.stack_pool, None) {
                 rtdebug!("*about to submit task1*");
-                Scheduler::run_task(task1.take());
+                Scheduler::run_task(task1);
                 rtdebug!("*about to submit task3*");
-                Scheduler::run_task(task3.take());
+                Scheduler::run_task(task3);
                 rtdebug!("*done with special_task*");
-                chan.take().send(());
+                chan.send(());
             };
 
             rtdebug!("special task: {}", borrow::to_uint(special_task));
@@ -1176,24 +1189,20 @@ mod test {
 
     #[test]
     fn handle() {
-        use rt::comm::*;
-
         do run_in_bare_thread {
-            let (port, chan) = oneshot::<()>();
-            let port = Cell::new(port);
-            let chan = Cell::new(chan);
+            let (port, chan) = Chan::new();
 
             let thread_one = do Thread::start {
-                let chan = Cell::new(chan.take());
+                let chan = chan;
                 do run_in_newsched_task_core {
-                    chan.take().send(());
+                    chan.send(());
                 }
             };
 
             let thread_two = do Thread::start {
-                let port = Cell::new(port.take());
+                let port = port;
                 do run_in_newsched_task_core {
-                    port.take().recv();
+                    port.recv();
                 }
             };
 
@@ -1249,7 +1258,6 @@ mod test {
 
     #[test]
     fn multithreading() {
-        use rt::comm::*;
         use num::Times;
         use vec::OwnedVector;
         use container::Container;
@@ -1257,10 +1265,9 @@ mod test {
         do run_in_mt_newsched_task {
             let mut ports = ~[];
             10.times(|| {
-                let (port, chan) = oneshot();
-                let chan_cell = Cell::new(chan);
+                let (port, chan) = Chan::new();
                 do spawntask_later {
-                    chan_cell.take().send(());
+                    chan.send(());
                 }
                 ports.push(port);
             });
@@ -1273,21 +1280,17 @@ mod test {
 
      #[test]
     fn thread_ring() {
-        use rt::comm::*;
-        use comm::{GenericPort, GenericChan};
-
         do run_in_mt_newsched_task {
-            let (end_port, end_chan) = oneshot();
+            let (end_port, end_chan) = Chan::new();
 
             let n_tasks = 10;
             let token = 2000;
 
-            let (p, ch1) = stream();
-            let mut p = p;
+            let (mut p, ch1) = Chan::new();
             ch1.send((token, end_chan));
             let mut i = 2;
             while i <= n_tasks {
-                let (next_p, ch) = stream();
+                let (next_p, ch) = Chan::new();
                 let imm_i = i;
                 let imm_p = p;
                 do spawntask_random {
@@ -1296,23 +1299,23 @@ mod test {
                 p = next_p;
                 i += 1;
             }
-            let imm_p = p;
-            let imm_ch = ch1;
+            let p = p;
             do spawntask_random {
-                roundtrip(1, n_tasks, &imm_p, &imm_ch);
+                roundtrip(1, n_tasks, &p, &ch1);
             }
 
             end_port.recv();
         }
 
         fn roundtrip(id: int, n_tasks: int,
-                     p: &Port<(int, ChanOne<()>)>, ch: &Chan<(int, ChanOne<()>)>) {
+                     p: &Port<(int, Chan<()>)>,
+                     ch: &Chan<(int, Chan<()>)>) {
             while (true) {
                 match p.recv() {
                     (1, end_chan) => {
-                                debug!("{}\n", id);
-                                end_chan.send(());
-                                return;
+                        debug!("{}\n", id);
+                        end_chan.send(());
+                        return;
                     }
                     (token, end_chan) => {
                         debug!("thread: {}   got token: {}", id, token);
@@ -1351,16 +1354,14 @@ mod test {
 
     // FIXME: #9407: xfail-test
     fn dont_starve_1() {
-        use rt::comm::oneshot;
-
         stress_factor().times(|| {
             do run_in_mt_newsched_task {
-                let (port, chan) = oneshot();
+                let (port, chan) = Chan::new();
 
                 // This task should not be able to starve the sender;
                 // The sender should get stolen to another thread.
                 do spawntask {
-                    while !port.peek() { }
+                    while port.try_recv().is_none() { }
                 }
 
                 chan.send(());
@@ -1370,17 +1371,15 @@ mod test {
 
     #[test]
     fn dont_starve_2() {
-        use rt::comm::oneshot;
-
         stress_factor().times(|| {
             do run_in_newsched_task {
-                let (port, chan) = oneshot();
-                let (_port2, chan2) = stream();
+                let (port, chan) = Chan::new();
+                let (_port2, chan2) = Chan::new();
 
                 // This task should not be able to starve the other task.
                 // The sends should eventually yield.
                 do spawntask {
-                    while !port.peek() {
+                    while port.try_recv().is_none() {
                         chan2.send(());
                     }
                 }

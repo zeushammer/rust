@@ -25,8 +25,6 @@
 
 #[allow(missing_doc)];
 
-use std::cell::Cell;
-use std::comm::{PortOne, oneshot};
 use std::util::replace;
 
 /// A type encapsulating the result of a computation which may not be complete
@@ -105,7 +103,7 @@ impl<A> Future<A> {
 }
 
 impl<A:Send> Future<A> {
-    pub fn from_port(port: PortOne<A>) -> Future<A> {
+    pub fn from_port(port: Port<A>) -> Future<A> {
         /*!
          * Create a future from a port
          *
@@ -113,9 +111,8 @@ impl<A:Send> Future<A> {
          * waiting for the result to be received on the port.
          */
 
-        let port = Cell::new(port);
         do Future::from_fn {
-            port.take().recv()
+            port.recv()
         }
     }
 
@@ -127,7 +124,7 @@ impl<A:Send> Future<A> {
          * value of the future.
          */
 
-        let (port, chan) = oneshot();
+        let (port, chan) = Chan::new();
 
         do spawn {
             chan.send(blk());
@@ -141,8 +138,6 @@ impl<A:Send> Future<A> {
 mod test {
     use future::Future;
 
-    use std::cell::Cell;
-    use std::comm::oneshot;
     use std::task;
 
     #[test]
@@ -153,7 +148,7 @@ mod test {
 
     #[test]
     fn test_from_port() {
-        let (po, ch) = oneshot();
+        let (po, ch) = Chan::new();
         ch.send(~"whale");
         let mut f = Future::from_port(po);
         assert_eq!(f.get(), ~"whale");
@@ -199,9 +194,9 @@ mod test {
     #[test]
     fn test_sendable_future() {
         let expected = "schlorf";
-        let f = Cell::new(do Future::spawn { expected });
+        let f = do Future::spawn { expected };
         do task::spawn {
-            let mut f = f.take();
+            let mut f = f;
             let actual = f.get();
             assert_eq!(actual, expected);
         }

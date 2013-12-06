@@ -19,9 +19,6 @@
 
 
 use std::borrow;
-use std::comm;
-use std::comm::SendDeferred;
-use std::comm::{GenericPort, Peekable};
 use std::unstable::sync::{Exclusive, UnsafeArc};
 use std::unstable::atomics;
 use std::unstable::finally::Finally;
@@ -34,48 +31,53 @@ use std::util::NonCopyable;
 
 // Each waiting task receives on one of these.
 #[doc(hidden)]
-type WaitEnd = comm::PortOne<()>;
+type WaitEnd = Port<()>;
 #[doc(hidden)]
-type SignalEnd = comm::ChanOne<()>;
+type SignalEnd = Chan<()>;
 // A doubly-ended queue of waiting tasks.
 #[doc(hidden)]
-struct WaitQueue { head: comm::Port<SignalEnd>,
-                   tail: comm::Chan<SignalEnd> }
+struct WaitQueue { head: Port<SignalEnd>,
+                   tail: Chan<SignalEnd> }
 
 impl WaitQueue {
     fn new() -> WaitQueue {
-        let (block_head, block_tail) = comm::stream();
+        let (block_head, block_tail) = Chan::new();
         WaitQueue { head: block_head, tail: block_tail }
     }
 
     // Signals one live task from the queue.
     fn signal(&self) -> bool {
-        // The peek is mandatory to make sure recv doesn't block.
-        if self.head.peek() {
-            // Pop and send a wakeup signal. If the waiter was killed, its port
-            // will have closed. Keep trying until we get a live task.
-            if self.head.recv().try_send_deferred(()) {
-                true
-            } else {
-                self.signal()
+        match self.head.try_recv() {
+            Some(ch) => {
+                // Send a wakeup signal. If the waiter was killed, its port will
+                // have closed. Keep trying until we get a live task.
+                if ch.try_send_deferred(()) {
+                    true
+                } else {
+                    self.signal()
+                }
             }
-        } else {
-            false
+            None => false
         }
     }
 
     fn broadcast(&self) -> uint {
         let mut count = 0;
-        while self.head.peek() {
-            if self.head.recv().try_send_deferred(()) {
-                count += 1;
+        loop {
+            match self.head.try_recv() {
+                None => break,
+                Some(ch) => {
+                    if ch.try_send_deferred(()) {
+                        count += 1;
+                    }
+                }
             }
         }
         count
     }
 
     fn wait_end(&self) -> WaitEnd {
-        let (wait_end, signal_end) = comm::oneshot();
+        let (wait_end, signal_end) = Chan::new();
         self.tail.send_deferred(signal_end);
         wait_end
     }
@@ -282,8 +284,7 @@ impl<'self> Condvar<'self> {
                               condvar_id,
                               "cond.signal_on()",
                               || {
-                let queue = queue.take_unwrap();
-                queue.broadcast()
+                queue.take_unwrap().broadcast()
             })
         }
     }
@@ -677,7 +678,6 @@ mod tests {
 
     use std::cast;
     use std::cell::Cell;
-    use std::comm;
     use std::result;
     use std::task;
 
@@ -712,7 +712,7 @@ mod tests {
     #[test]
     fn test_sem_as_cvar() {
         /* Child waits and parent signals */
-        let (p, c) = comm::stream();
+        let (p, c) = Chan::new();
         let s = Semaphore::new(0);
         let s2 = s.clone();
         do task::spawn {
@@ -724,7 +724,7 @@ mod tests {
         let _ = p.recv();
 
         /* Parent waits and child signals */
-        let (p, c) = comm::stream();
+        let (p, c) = Chan::new();
         let s = Semaphore::new(0);
         let s2 = s.clone();
         do task::spawn {
@@ -741,8 +741,8 @@ mod tests {
         // time, and shake hands.
         let s = Semaphore::new(2);
         let s2 = s.clone();
-        let (p1,c1) = comm::stream();
-        let (p2,c2) = comm::stream();
+        let (p1,c1) = Chan::new();
+        let (p2,c2) = Chan::new();
         do task::spawn {
             s2.access(|| {
                 let _ = p2.recv();
@@ -761,7 +761,7 @@ mod tests {
         do task::spawn_sched(task::SingleThreaded) {
             let s = Semaphore::new(1);
             let s2 = s.clone();
-            let (p, c) = comm::stream();
+            let (p, c) = Chan::new();
             let child_data = Cell::new((s2, c));
             s.access(|| {
                 let (s2, c) = child_data.take();
@@ -783,7 +783,7 @@ mod tests {
     fn test_mutex_lock() {
         // Unsafely achieve shared state, and do the textbook
         // "load tmp = move ptr; inc tmp; store ptr <- tmp" dance.
-        let (p, c) = comm::stream();
+        let (p, c) = Chan::new();
         let m = Mutex::new();
         let m2 = m.clone();
         let mut sharedstate = ~0;
@@ -830,7 +830,7 @@ mod tests {
             cond.wait();
         });
         // Parent wakes up child
-        let (port,chan) = comm::stream();
+        let (port,chan) = Chan::new();
         let m3 = m.clone();
         do task::spawn {
             m3.lock_cond(|cond| {
@@ -853,7 +853,7 @@ mod tests {
 
         num_waiters.times(|| {
             let mi = m.clone();
-            let (port, chan) = comm::stream();
+            let (port, chan) = Chan::new();
             ports.push(port);
             do task::spawn {
                 mi.lock_cond(|cond| {
@@ -865,13 +865,13 @@ mod tests {
         });
 
         // wait until all children get in the mutex
-        for port in ports.iter() { let _ = port.recv(); }
+        for port in ports.mut_iter() { let _ = port.recv(); }
         m.lock_cond(|cond| {
             let num_woken = cond.broadcast();
             assert_eq!(num_woken, num_waiters);
         });
         // wait until all children wake up
-        for port in ports.iter() { let _ = port.recv(); }
+        for port in ports.mut_iter() { let _ = port.recv(); }
     }
     #[test]
     fn test_mutex_cond_broadcast() {
@@ -916,8 +916,8 @@ mod tests {
         let m2 = m.clone();
 
         let result: result::Result<(), ~Any> = do task::try {
-            let (p, c) = comm::stream();
-            do task::spawn || { // linked
+            let (p, c) = Chan::new();
+            do task::spawn { // linked
                 let _ = p.recv(); // wait for sibling to get in the mutex
                 task::deschedule();
                 fail!();
@@ -941,19 +941,17 @@ mod tests {
 
         let m = Mutex::new();
         let m2 = m.clone();
-        let (p, c) = comm::stream();
+        let (p, c) = Chan::new();
 
         let result: result::Result<(), ~Any> = do task::try {
             let mut sibling_convos = ~[];
             2.times(|| {
-                let (p, c) = comm::stream();
-                let c = Cell::new(c);
+                let (p, c) = Chan::new();
                 sibling_convos.push(p);
                 let mi = m2.clone();
                 // spawn sibling task
                 do task::spawn { // linked
                     mi.lock_cond(|cond| {
-                        let c = c.take();
                         c.send(()); // tell sibling to go ahead
                         (|| {
                             cond.wait(); // block forever
@@ -965,7 +963,7 @@ mod tests {
                     })
                 }
             });
-            for p in sibling_convos.iter() {
+            for p in sibling_convos.mut_iter() {
                 let _ = p.recv(); // wait for sibling to get in the mutex
             }
             m2.lock(|| { });
@@ -974,8 +972,8 @@ mod tests {
         };
         assert!(result.is_err());
         // child task must have finished by the time try returns
-        let r = p.recv();
-        for p in r.iter() { p.recv(); } // wait on all its siblings
+        let mut r = p.recv();
+        for p in r.mut_iter() { p.recv(); } // wait on all its siblings
         m.lock_cond(|cond| {
             let woken = cond.broadcast();
             assert_eq!(woken, 0);
@@ -1000,7 +998,7 @@ mod tests {
         let result = do task::try {
             let m = Mutex::new_with_condvars(2);
             let m2 = m.clone();
-            let (p, c) = comm::stream();
+            let (p, c) = Chan::new();
             do task::spawn {
                 m2.lock_cond(|cond| {
                     c.send(());
@@ -1061,7 +1059,7 @@ mod tests {
                                  mode2: RWLockMode) {
         // Test mutual exclusion between readers and writers. Just like the
         // mutex mutual exclusion test, a ways above.
-        let (p, c) = comm::stream();
+        let (p, c) = Chan::new();
         let x2 = x.clone();
         let mut sharedstate = ~0;
         {
@@ -1112,8 +1110,8 @@ mod tests {
                                  make_mode2_go_first: bool) {
         // Much like sem_multi_resource.
         let x2 = x.clone();
-        let (p1, c1) = comm::stream();
-        let (p2, c2) = comm::stream();
+        let (p1, c1) = Chan::new();
+        let (p2, c2) = Chan::new();
         do task::spawn {
             if !make_mode2_go_first {
                 let _ = p2.recv(); // parent sends to us once it locks, or ...
@@ -1178,7 +1176,7 @@ mod tests {
             cond.wait();
         });
         // Parent wakes up child
-        let (port, chan) = comm::stream();
+        let (port, chan) = Chan::new();
         let x3 = x.clone();
         do task::spawn {
             x3.write_cond(|cond| {
@@ -1215,7 +1213,7 @@ mod tests {
 
         num_waiters.times(|| {
             let xi = x.clone();
-            let (port, chan) = comm::stream();
+            let (port, chan) = Chan::new();
             ports.push(port);
             do task::spawn {
                 lock_cond(&xi, dg1, |cond| {
@@ -1227,13 +1225,13 @@ mod tests {
         });
 
         // wait until all children get in the mutex
-        for port in ports.iter() { let _ = port.recv(); }
+        for port in ports.mut_iter() { let _ = port.recv(); }
         lock_cond(&x, dg2, |cond| {
             let num_woken = cond.broadcast();
             assert_eq!(num_woken, num_waiters);
         });
         // wait until all children wake up
-        for port in ports.iter() { let _ = port.recv(); }
+        for port in ports.mut_iter() { let _ = port.recv(); }
     }
     #[test]
     fn test_rwlock_cond_broadcast() {

@@ -56,11 +56,10 @@
 use prelude::*;
 
 use cell::Cell;
-use comm::{stream, Chan, GenericChan, GenericPort, Port, Peekable};
+use comm::{Chan, Port};
 use result::{Result, Ok, Err};
 use rt::in_green_task_context;
 use rt::local::Local;
-use rt::task::{UnwindResult, Success, Failure};
 use send_str::{SendStr, IntoSendStr};
 use util;
 
@@ -81,33 +80,6 @@ pub mod spawn;
 /// If you wish for this result's delivery to block until all linked and/or
 /// children tasks complete, recommend using a result future.
 pub type TaskResult = Result<(), ~Any>;
-
-pub struct TaskResultPort {
-    priv port: Port<UnwindResult>
-}
-
-fn to_task_result(res: UnwindResult) -> TaskResult {
-    match res {
-        Success => Ok(()), Failure(a) => Err(a),
-    }
-}
-
-impl GenericPort<TaskResult> for TaskResultPort {
-    #[inline]
-    fn recv(&self) -> TaskResult {
-        to_task_result(self.port.recv())
-    }
-
-    #[inline]
-    fn try_recv(&self) -> Option<TaskResult> {
-        self.port.try_recv().map(to_task_result)
-    }
-}
-
-impl Peekable<TaskResult> for TaskResultPort {
-    #[inline]
-    fn peek(&self) -> bool { self.port.peek() }
-}
 
 /// Scheduler modes
 #[deriving(Eq)]
@@ -151,7 +123,7 @@ pub struct SchedOpts {
  */
 pub struct TaskOpts {
     priv watched: bool,
-    priv notify_chan: Option<Chan<UnwindResult>>,
+    priv notify_chan: Option<Chan<TaskResult>>,
     name: Option<SendStr>,
     sched: SchedOpts,
     stack_size: Option<uint>
@@ -233,7 +205,7 @@ impl TaskBuilder {
     ///
     /// # Failure
     /// Fails if a future_result was already set for this task.
-    pub fn future_result(&mut self) -> TaskResultPort {
+    pub fn future_result(&mut self) -> Port<TaskResult> {
         // FIXME (#3725): Once linked failure and notification are
         // handled in the library, I can imagine implementing this by just
         // registering an arbitrary number of task::on_exit handlers and
@@ -244,12 +216,12 @@ impl TaskBuilder {
         }
 
         // Construct the future and give it to the caller.
-        let (notify_pipe_po, notify_pipe_ch) = stream::<UnwindResult>();
+        let (notify_pipe_po, notify_pipe_ch) = Chan::new();
 
         // Reconfigure self to use a notify channel.
         self.opts.notify_chan = Some(notify_pipe_ch);
 
-        TaskResultPort { port: notify_pipe_po }
+        notify_pipe_po
     }
 
     /// Name the task-to-be. Currently the name is used for identification
@@ -344,7 +316,7 @@ impl TaskBuilder {
      * Fails if a future_result was already set for this task.
      */
     pub fn try<T:Send>(mut self, f: proc() -> T) -> Result<T, ~Any> {
-        let (po, ch) = stream::<T>();
+        let (po, ch) = Chan::new();
 
         let result = self.future_result();
 
@@ -469,7 +441,7 @@ pub fn failing() -> bool {
 // !!! instead of exiting cleanly. This might wedge the buildbots.       !!!
 
 #[cfg(test)]
-fn block_forever() { let (po, _ch) = stream::<()>(); po.recv(); }
+fn block_forever() { let (po, _ch) = Chan::<()>::new(); po.recv(); }
 
 #[test]
 fn test_unnamed_task() {
@@ -531,9 +503,8 @@ fn test_send_named_task() {
 
 #[test]
 fn test_run_basic() {
-    let (po, ch) = stream::<()>();
-    let builder = task();
-    do builder.spawn {
+    let (po, ch) = Chan::new();
+    do task().spawn {
         ch.send(());
     }
     po.recv();
@@ -546,13 +517,11 @@ struct Wrapper {
 
 #[test]
 fn test_add_wrapper() {
-    let (po, ch) = stream::<()>();
+    let (po, ch) = Chan::new();
     let mut b0 = task();
-    let ch = Cell::new(ch);
     do b0.add_wrapper |body| {
-        let ch = Cell::new(ch.take());
+        let ch = ch;
         let result: proc() = proc() {
-            let ch = ch.take();
             body();
             ch.send(());
         };
@@ -613,8 +582,7 @@ fn get_sched_id() -> int {
 
 #[test]
 fn test_spawn_sched() {
-    let (po, ch) = stream::<()>();
-    let ch = SharedChan::new(ch);
+    let (po, ch) = SharedChan::new();
 
     fn f(i: int, ch: SharedChan<()>) {
         let parent_sched_id = get_sched_id();
@@ -637,17 +605,15 @@ fn test_spawn_sched() {
 
 #[test]
 fn test_spawn_sched_childs_on_default_sched() {
-    let (po, ch) = stream();
+    let (po, ch) = Chan::new();
 
     // Assuming tests run on the default scheduler
     let default_id = get_sched_id();
 
-    let ch = Cell::new(ch);
     do spawn_sched(SingleThreaded) {
+        let ch = ch;
         let parent_sched_id = get_sched_id();
-        let ch = Cell::new(ch.take());
         do spawn {
-            let ch = ch.take();
             let child_sched_id = get_sched_id();
             assert!(parent_sched_id != child_sched_id);
             assert_eq!(child_sched_id, default_id);
@@ -667,8 +633,8 @@ fn test_spawn_sched_blocking() {
         // Testing that a task in one scheduler can block in foreign code
         // without affecting other schedulers
         20u.times(|| {
-            let (start_po, start_ch) = stream();
-            let (fin_po, fin_ch) = stream();
+            let (start_po, start_ch) = Chan::new();
+            let (fin_po, fin_ch) = Chan::new();
 
             let mut lock = Mutex::new();
             let lock2 = Cell::new(lock.clone());
@@ -693,14 +659,14 @@ fn test_spawn_sched_blocking() {
                 let mut val = 20;
                 while val > 0 {
                     val = po.recv();
-                    ch.send(val - 1);
+                    ch.try_send(val - 1);
                 }
             }
 
-            let (setup_po, setup_ch) = stream();
-            let (parent_po, parent_ch) = stream();
+            let (setup_po, setup_ch) = Chan::new();
+            let (parent_po, parent_ch) = Chan::new();
             do spawn {
-                let (child_po, child_ch) = stream();
+                let (child_po, child_ch) = Chan::new();
                 setup_ch.send(child_ch);
                 pingpong(&child_po, &parent_ch);
             };
@@ -719,12 +685,12 @@ fn test_spawn_sched_blocking() {
 
 #[cfg(test)]
 fn avoid_copying_the_body(spawnfn: |v: proc()|) {
-    let (p, ch) = stream::<uint>();
+    let (p, ch) = Chan::<uint>::new();
 
     let x = ~1;
     let x_in_parent = ptr::to_unsafe_ptr(&*x) as uint;
 
-    do spawnfn || {
+    do spawnfn {
         let x_in_child = ptr::to_unsafe_ptr(&*x) as uint;
         ch.send(x_in_child);
     }
