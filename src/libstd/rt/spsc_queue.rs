@@ -1,5 +1,4 @@
-/* Multi-producer/multi-consumer bounded queue
- * Copyright (c) 2010-2011 Dmitry Vyukov. All rights reserved.
+/* Copyright (c) 2010-2011 Dmitry Vyukov. All rights reserved.
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
  *
@@ -31,7 +30,7 @@ use cast;
 use kinds::Send;
 use ops::Drop;
 use option::{Some, None, Option};
-use unstable::atomics::{AtomicPtr, Relaxed, AtomicUint};
+use unstable::atomics::{AtomicPtr, Relaxed, AtomicUint, Acquire, Release};
 use unstable::sync::UnsafeArc;
 
 // Node within the linked list queue of messages to send
@@ -136,7 +135,7 @@ impl<T: Send, P: Send> State<T, P> {
         assert!((*n).value.is_none());
         (*n).value = Some(t);
         (*n).next.store(0 as *mut Node<T>, Relaxed);
-        (*self.head).next.store(n, Relaxed);
+        (*self.head).next.store(n, Release);
         self.head = n;
     }
 
@@ -156,7 +155,7 @@ impl<T: Send, P: Send> State<T, P> {
         }
         // If the above fails, then update our copy of the tail and try
         // again.
-        self.tail_copy = self.tail_prev.load(Relaxed);
+        self.tail_copy = self.tail_prev.load(Acquire);
         if self.first != self.tail_copy {
             if self.cache_bound > 0 {
                 let b = self.cache_subtractions.load(Relaxed);
@@ -179,14 +178,14 @@ impl<T: Send, P: Send> State<T, P> {
         // tail's next field and see if we can use it. If we do a pop, then
         // the current tail node is a candidate for going into the cache.
         let tail = self.tail;
-        let next = (*tail).next.load(Relaxed);
+        let next = (*tail).next.load(Acquire);
         if next.is_null() { return None }
         assert!((*next).value.is_some());
         let ret = (*next).value.take();
 
         self.tail = next;
         if self.cache_bound == 0 {
-            self.tail_prev.store(tail, Relaxed);
+            self.tail_prev.store(tail, Release);
         } else {
             // XXX: this is dubious with overflow.
             let additions = self.cache_additions.load(Relaxed);
@@ -194,7 +193,7 @@ impl<T: Send, P: Send> State<T, P> {
             let size = additions - subtractions;
 
             if size < self.cache_bound {
-                self.tail_prev.store(tail, Relaxed);
+                self.tail_prev.store(tail, Release);
                 self.cache_additions.store(additions + 1, Relaxed);
             } else {
                 (*self.tail_prev.load(Relaxed)).next.store(next, Relaxed);
@@ -208,7 +207,7 @@ impl<T: Send, P: Send> State<T, P> {
 
     unsafe fn is_empty(&self) -> bool {
         let tail = self.tail;
-        let next = (*tail).next.load(Relaxed);
+        let next = (*tail).next.load(Acquire);
         return next.is_null();
     }
 }

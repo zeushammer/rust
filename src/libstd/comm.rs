@@ -57,32 +57,34 @@
 //!
 //! # Example
 //!
-//!     // Create a simple streaming channel
-//!     let (port, chan) = Chan::new();
+//! ```rust
+//! // Create a simple streaming channel
+//! let (port, chan) = Chan::new();
+//! do spawn {
+//!     chan.send(10);
+//! }
+//! assert_eq!(port.recv(), 10);
+//!
+//! // Create a shared channel which can be sent along from many tasks
+//! let (port, chan) = SharedChan::new();
+//! for i in range(0, 10) {
+//!     let chan = chan.clone();
 //!     do spawn {
-//!         chan.send(10);
+//!         chan.send(i);
 //!     }
-//!     assert_eq!(port.recv(), 10);
+//! }
 //!
-//!     // Create a shared channel which can be sent along from many tasks
-//!     let (port, chan) = SharedChan::new();
-//!     for i in range(0, 10) {
-//!         let chan = chan.clone();
-//!         do spawn {
-//!             chan.send(i);
-//!         }
-//!     }
+//! for _ in range(0, 10) {
+//!     let j = port.recv();
+//!     assert!(0 <= j && j < 10);
+//! }
 //!
-//!     for _ in range(0, 10) {
-//!         let j = port.recv();
-//!         assert!(0 <= j && j < 10);
-//!     }
-//!
-//!     // The call to recv() will fail!() because the channel has already hung
-//!     // up (or been deallocated)
-//!     let (port, chan) = Chan::new();
-//!     drop(chan);
-//!     port.recv();
+//! // The call to recv() will fail!() because the channel has already hung
+//! // up (or been deallocated)
+//! let (port, chan) = Chan::new();
+//! drop(chan);
+//! port.recv();
+//! ```
 
 // A description of how Rust's channel implementation works
 //
@@ -100,7 +102,7 @@
 //
 // Rust channels come in two flavors: streams and shared channels. A stream has
 // one sender and one receiver while a shared channel could have multiple
-// receivers. This choice heavily influences the design of the protocol set
+// senders. This choice heavily influences the design of the protocol set
 // forth for both senders/receivers.
 //
 // ## Concurrent queues
@@ -129,7 +131,7 @@
 // this was an unnecessary limitation of the implementation, so I have altered
 // the queue to optionally have a bound on the cache size.
 //
-// By default, streams will this unbounded SPSC queue with a small-ish cache
+// By default, streams will have an unbounded SPSC queue with a small-ish cache
 // size. The hope is that the cache is still large enough to have very fast
 // send() operations while not too large such that millions of channels can
 // coexist at once.
@@ -787,8 +789,8 @@ impl Packet {
         return prev >= 0;
     }
 
-    // Decrement the refere count on a channel. This is called whenever a Chan
-    // is dropped and may end up waking up a receiver. It's the receiver's
+    // Decrement the reference count on a channel. This is called whenever a
+    // Chan is dropped and may end up waking up a receiver. It's the receiver's
     // responsibility on the other end to figure out that we've disconnected.
     unsafe fn drop_chan(&mut self) {
         match self.channels.fetch_sub(1, SeqCst) {
